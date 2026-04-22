@@ -70,7 +70,8 @@ def get_device_and_loader_settings():
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
-
+        batch_size = 64
+        num_workers = 4
         # Deterministic-minded CUDA settings
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
