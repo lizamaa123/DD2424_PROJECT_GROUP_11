@@ -1,0 +1,28 @@
+# Environment files
+.env
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg-info/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+
+# IDE settings
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
