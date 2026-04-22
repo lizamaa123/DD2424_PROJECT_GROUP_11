@@ -35,7 +35,8 @@ class OxfordPetBinaryDataset(Dataset):
                 image_name, class_id, species, breed_id = line.split()
                 image_path = images_dir / f"{image_name}.jpg"
 
-                # species = 1 for cat, 2 for dog
+                # Oxford-IIIT Pet convention:
+                # species = 1 -> cat, 2 -> dog
                 label = 0 if int(species) == 1 else 1
 
                 if image_path.exists():
@@ -60,6 +61,8 @@ def get_transforms():
     weights = ResNet18_Weights.DEFAULT
     base_transform = weights.transforms()
 
+    # Official ResNet-18 preprocessing from torchvision weights.
+    # We keep a small horizontal flip augmentation for training only.
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(),
         base_transform,
@@ -70,7 +73,57 @@ def get_transforms():
     return train_transform, test_transform
 
 
-def get_data_loaders(dataset_dir: Path, batch_size: int = 32, num_workers: int = 0):
+def get_device_and_loader_settings():
+    """
+    Returns:
+        device: torch.device
+        batch_size: int
+        num_workers: int
+        pin_memory: bool
+        persistent_workers: bool
+        use_amp: bool
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+
+        # Allow more computer torture for a dedicated GPU
+        batch_size = 128
+        num_workers = 4
+        pin_memory = True
+        persistent_workers = num_workers > 0
+        use_amp = True
+
+        torch.backends.cudnn.benchmark = True
+
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+
+        # Safer defaults for Apple Silicon
+        batch_size = 32
+        num_workers = 0
+        pin_memory = False
+        persistent_workers = False
+        use_amp = False
+
+    else:
+        device = torch.device("cpu")
+
+        batch_size = 32
+        num_workers = 0
+        pin_memory = False
+        persistent_workers = False
+        use_amp = False
+
+    return device, batch_size, num_workers, pin_memory, persistent_workers, use_amp
+
+
+def get_data_loaders(
+    dataset_dir: Path,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+):
     images_dir = dataset_dir / "images"
     annotations_dir = dataset_dir / "annotations"
 
@@ -87,7 +140,8 @@ def get_data_loaders(dataset_dir: Path, batch_size: int = 32, num_workers: int =
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
 
     test_loader = DataLoader(
@@ -95,7 +149,8 @@ def get_data_loaders(dataset_dir: Path, batch_size: int = 32, num_workers: int =
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
 
     return train_loader, test_loader
@@ -106,7 +161,7 @@ def set_batchnorm_eval(module):
         module.eval()
 
 
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, use_amp: bool):
     model.eval()
     total_loss = 0.0
     correct = 0
@@ -114,11 +169,16 @@ def evaluate(model, loader, criterion, device):
 
     with torch.no_grad():
         for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(device, non_blocking=(device.type == "cuda"))
+            labels = labels.to(device, non_blocking=(device.type == "cuda"))
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            if use_amp:
+                with torch.amp.autocast(device_type="cuda"):
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+            else:
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
             total_loss += loss.item() * images.size(0)
             preds = outputs.argmax(dim=1)
@@ -135,6 +195,7 @@ def train_model(
     train_loader,
     test_loader,
     device,
+    use_amp: bool,
     epochs: int = 10,
     lr: float = 1e-4,
     weight_decay: float = 1e-4,
@@ -142,10 +203,13 @@ def train_model(
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.fc.parameters(), lr=lr, weight_decay=weight_decay)
 
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     for epoch in range(1, epochs + 1):
         model.train()
 
-        # Important: keep BatchNorm layers in eval mode when backbone is frozen
+        # Important when backbone is frozen:
+        # keep BatchNorm layers in eval mode so running stats do not drift.
         model.apply(set_batchnorm_eval)
 
         running_loss = 0.0
@@ -153,28 +217,40 @@ def train_model(
         total = 0
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch:02d}/{epochs}", leave=False)
+
         for images, labels in progress_bar:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            images = images.to(device, non_blocking=(device.type == "cuda"))
+            labels = labels.to(device, non_blocking=(device.type == "cuda"))
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+
+            if use_amp:
+                with torch.amp.autocast(device_type="cuda"):
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
 
             running_loss += loss.item() * images.size(0)
             preds = outputs.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
+
             progress_bar.set_postfix(loss=f"{loss.item():.4f}")
 
         train_loss = running_loss / total
         train_acc = correct / total
 
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device, use_amp)
 
-        print(
+        tqdm.write(
             f"Epoch {epoch:02d}/{epochs} | "
             f"Train loss: {train_loss:.4f}, Train acc: {train_acc:.4%} | "
             f"Test loss: {test_loss:.4f}, Test acc: {test_acc:.4%}"
@@ -195,19 +271,27 @@ def main():
 
     set_seed(42)
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    (
+        device,
+        batch_size,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        use_amp,
+    ) = get_device_and_loader_settings()
 
     print(f"Using device: {device}")
+    print(
+        f"Settings | batch_size={batch_size}, num_workers={num_workers}, "
+        f"pin_memory={pin_memory}, persistent_workers={persistent_workers}, use_amp={use_amp}"
+    )
 
     train_loader, test_loader = get_data_loaders(
         dataset_dir=dataset_dir,
-        batch_size=32,
-        num_workers=0,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
 
     weights = ResNet18_Weights.DEFAULT
@@ -220,6 +304,7 @@ def main():
     # Replace final layer for binary classification
     num_features = model.fc.in_features
     model.fc = nn.Linear(num_features, 2)
+
     model = model.to(device)
 
     train_model(
@@ -227,7 +312,8 @@ def main():
         train_loader=train_loader,
         test_loader=test_loader,
         device=device,
-        epochs=5,
+        use_amp=use_amp,
+        epochs=10,
         lr=1e-4,
         weight_decay=1e-4,
     )
