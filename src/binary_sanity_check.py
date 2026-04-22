@@ -70,8 +70,6 @@ def get_device_and_loader_settings():
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        batch_size = 64
-        num_workers = 4
         # Deterministic-minded CUDA settings
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
@@ -260,8 +258,8 @@ def main():
         test_loader=test_loader,
         device=device,
         epochs=5,
-        lr=1e-3,
-        weight_decay=1e-4,
+        lr=2e-3,
+        weight_decay=1e-3,
     )
 
     elapsed_seconds = time.time() - start_time
