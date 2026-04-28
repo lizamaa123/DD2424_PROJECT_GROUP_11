@@ -5,13 +5,13 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.models import ResNet18_Weights
 
-class OxfordPetBinaryDataset(Dataset):
+class OxfordPetDataset(Dataset):
     def __init__(self, split_file: Path, images_dir: Path, transform=None):
         self.images_dir = images_dir
         self.transform = transform
         self.samples = []
 
-        with open(split_file, "r") as f:
+        with open(split_file, "r") as f: 
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -20,8 +20,8 @@ class OxfordPetBinaryDataset(Dataset):
                 image_name, _class_id, species, _breed_id = line.split()
                 image_path = images_dir / f"{image_name}.jpg"
 
-                # species = 1 -> cat, 2 -> dog
-                label = 0 if int(species) == 1 else 1
+                # now using the 37 category (0-36 indexed)
+                label = int(_class_id) - 1
 
                 if image_path.exists():
                     self.samples.append((image_path, label))
@@ -61,8 +61,8 @@ def get_data_loaders(
 
     transform = get_transform()
 
-    train_dataset = OxfordPetBinaryDataset(train_file, images_dir, transform=transform)
-    test_dataset = OxfordPetBinaryDataset(test_file, images_dir, transform=transform)
+    train_dataset = OxfordPetDataset(train_file, images_dir, transform=transform)
+    test_dataset = OxfordPetDataset(test_file, images_dir, transform=transform)
 
     generator = torch.Generator()
     generator.manual_seed(42)

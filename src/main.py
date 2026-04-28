@@ -79,8 +79,8 @@ def main():
     for param in model.parameters():
         param.requires_grad = False
 
-    # Replace final layer for binary classification
-    model.fc = nn.Linear(model.fc.in_features, 2)
+    # Replace final layer for 37 classification
+    model.fc = nn.Linear(model.fc.in_features, 37)
     model = model.to(device)
 
     # Create results directory
