@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.models import ResNet18_Weights
 
-class OxfordPetBinaryDataset(Dataset):
+class OxfordPetDataset(Dataset):
     def __init__(self, split_file: Path, images_dir: Path, transform=None):
         self.images_dir = images_dir
         self.transform = transform
@@ -61,8 +61,8 @@ def get_data_loaders(
 
     transform = get_transform()
 
-    train_dataset = OxfordPetBinaryDataset(train_file, images_dir, transform=transform)
-    test_dataset = OxfordPetBinaryDataset(test_file, images_dir, transform=transform)
+    train_dataset = OxfordPetDataset(train_file, images_dir, transform=transform)
+    test_dataset = OxfordPetDataset(test_file, images_dir, transform=transform)
 
     generator = torch.Generator()
     generator.manual_seed(42)
