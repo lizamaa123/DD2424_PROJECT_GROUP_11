@@ -93,17 +93,17 @@ def main():
         train_loader=train_loader,
         test_loader=test_loader,
         device=device,
-        epochs=5,
+        epochs=10,
         lr=2e-3,
         weight_decay=1e-3,
     )
 
     # Save the best model weights
-    model_save_path = results_dir / "best_binary_model.pth"
+    model_save_path = results_dir / "best_linear_probe_model.pth"
     torch.save(model.state_dict(), model_save_path)
 
     # Save the training curves
-    plot_save_path = results_dir / "training_curves.png"
+    plot_save_path = results_dir / "training_curves_linear_probe.png"
     save_training_curves(history, plot_save_path)
 
     elapsed_seconds = time.time() - start_time
