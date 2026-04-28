@@ -11,7 +11,7 @@ class OxfordPetDataset(Dataset):
         self.transform = transform
         self.samples = []
 
-        with open(split_file, "r") as f:
+        with open(split_file, "r") as f: 
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -21,7 +21,7 @@ class OxfordPetDataset(Dataset):
                 image_path = images_dir / f"{image_name}.jpg"
 
                 # now using the 37 category (0-36 indexed)
-                label = int(species) - 1
+                label = int(_class_id) - 1
 
                 if image_path.exists():
                     self.samples.append((image_path, label))
