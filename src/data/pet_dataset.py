@@ -20,8 +20,8 @@ class OxfordPetDataset(Dataset):
                 image_name, _class_id, species, _breed_id = line.split()
                 image_path = images_dir / f"{image_name}.jpg"
 
-                # species = 1 -> cat, 2 -> dog
-                label = 0 if int(species) == 1 else 1
+                # now using the 37 category (0-36 indexed)
+                label = int(species) - 1
 
                 if image_path.exists():
                     self.samples.append((image_path, label))
