@@ -1,5 +1,8 @@
 torch
 torchvision
-Pillow
+pillow
 python-dotenv
 tqdm
+numpy
+matplotlib
+scikit-learn
