@@ -73,22 +73,22 @@ def main():
     )
 
     L = 4
-    l_history = {}
+    weights = ResNet18_Weights.DEFAULT
+    model = models.resnet18(weights=weights)
+
+    # Replace final layer for 37 classification
+    model.fc = nn.Linear(model.fc.in_features, 37)
+    model = model.to(device)
     
     # Create results directory
     results_dir = Path("results")
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    for l in range(1, L + 1):
+    for l in range(0, L + 1):
         print(f"Unfreezing last l = {l} layers")
 
-        weights = ResNet18_Weights.DEFAULT
-        model = models.resnet18(weights=weights)
-
-        # Replace final layer for 37 classification
-        model.fc = nn.Linear(model.fc.in_features, 37)
         model = set_parameter_requires_grad(model, l=l)
-        model = model.to(device)
+        current_lr = 2e-3 if l == 0 else 1e-4
 
         # Catch the returned model and history
         model, history = train_model(
@@ -97,18 +97,16 @@ def main():
             test_loader=test_loader,
             device=device,
             epochs=5,
-            lr=1e-4,
+            lr=current_lr,
             weight_decay=1e-4,
         )
 
-        l_history[f"l_{l}"] = history
-
         # Save the best model weights
-        model_save_path = results_dir / f"strat_1_{l}.pth"
+        model_save_path = results_dir / f"strat_2_{l}.pth"
         torch.save(model.state_dict(), model_save_path)
 
         # Save the training curves
-        plot_save_path = results_dir / f"strat_1_{l}.png"
+        plot_save_path = results_dir / f"strat_2_{l}.png"
         save_training_curves(history, plot_save_path)
 
         elapsed_seconds = time.time() - start_time
