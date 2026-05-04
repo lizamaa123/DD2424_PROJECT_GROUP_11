@@ -42,7 +42,14 @@ def train_model(
     weight_decay: float = 1e-4,
 ):
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.fc.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    # Pass only the parameters that are currently unfrozen
+    params_to_update = []
+    for p in model.parameters():
+        if p.requires_grad:
+            params_to_update.append(p)
+
+    optimizer = torch.optim.Adam(params_to_update, lr=lr, weight_decay=weight_decay)
 
     # track metrics and best model state
     history = {"train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []}
@@ -104,6 +111,32 @@ def train_model(
     model.load_state_dict(best_model_wts)
     return model, history
 
+def set_parameter_requires_grad(model, l):
+    # linear probing = freezing all conv. layers
+    for param in model.parameters():
+        param.requires_grad = False
+        
+    # unfreeze classification layer (last layer)
+    for param in model.fc.parameters():
+        param.requires_grad = True
+        
+    # unfreeze the last l conv. blocks (backwards)
+    layers_to_unfreeze = []
+    if l >= 1:
+        layers_to_unfreeze.append(model.layer4)
+    if l >= 2:
+        layers_to_unfreeze.append(model.layer3)
+    if l >= 3:
+        layers_to_unfreeze.append(model.layer2)
+    if l >= 4:
+        layers_to_unfreeze.append(model.layer1)
+        
+    # for loop to unfreeze layers in the list
+    for layer in layers_to_unfreeze:
+        for param in layer.parameters():
+            param.requires_grad = True
+            
+    return model
 
 # generate and save training curves
 def save_training_curves(history, save_path):

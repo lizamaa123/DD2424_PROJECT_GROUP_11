@@ -10,7 +10,7 @@ from torchvision.models import ResNet18_Weights
 from dotenv import load_dotenv
 
 from data.pet_dataset import get_data_loaders
-from training.engine import save_training_curves, train_model
+from training.engine import save_training_curves, train_model, set_parameter_requires_grad
 
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
@@ -72,42 +72,47 @@ def main():
         pin_memory=pin_memory,
     )
 
-    weights = ResNet18_Weights.DEFAULT
-    model = models.resnet18(weights=weights)
-
-    # Freeze pretrained backbone
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # Replace final layer for 37 classification
-    model.fc = nn.Linear(model.fc.in_features, 37)
-    model = model.to(device)
-
+    L = 4
+    l_history = {}
+    
     # Create results directory
     results_dir = Path("results")
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Catch the returned model and history
-    model, history = train_model(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        device=device,
-        epochs=10,
-        lr=2e-3,
-        weight_decay=1e-3,
-    )
+    for l in range(1, L + 1):
+        print(f"Unfreezing last l = {l} layers")
 
-    # Save the best model weights
-    model_save_path = results_dir / "best_linear_probe_model.pth"
-    torch.save(model.state_dict(), model_save_path)
+        weights = ResNet18_Weights.DEFAULT
+        model = models.resnet18(weights=weights)
 
-    # Save the training curves
-    plot_save_path = results_dir / "training_curves_linear_probe.png"
-    save_training_curves(history, plot_save_path)
+        # Replace final layer for 37 classification
+        model.fc = nn.Linear(model.fc.in_features, 37)
+        model = set_parameter_requires_grad(model, l=l)
+        model = model.to(device)
 
-    elapsed_seconds = time.time() - start_time
-    print(f"Total runtime: {elapsed_seconds:.2f} seconds")
+        # Catch the returned model and history
+        model, history = train_model(
+            model=model,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            device=device,
+            epochs=5,
+            lr=1e-4,
+            weight_decay=1e-4,
+        )
+
+        l_history[f"l_{l}"] = history
+
+        # Save the best model weights
+        model_save_path = results_dir / f"strat_1_{l}.pth"
+        torch.save(model.state_dict(), model_save_path)
+
+        # Save the training curves
+        plot_save_path = results_dir / f"strat_1_{l}.png"
+        save_training_curves(history, plot_save_path)
+
+        elapsed_seconds = time.time() - start_time
+        print(f"Total runtime: {elapsed_seconds:.2f} seconds")
 
 
 if __name__ == "__main__":
