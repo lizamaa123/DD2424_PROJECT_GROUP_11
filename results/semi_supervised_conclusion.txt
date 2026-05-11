@@ -1,0 +1,2 @@
+10pct: best threshold 0.80 improved macro-F1 by 0.0076 and accuracy by 0.0079.
+1pct: best threshold 0.80 did not improve macro-F1 (delta -0.0832).

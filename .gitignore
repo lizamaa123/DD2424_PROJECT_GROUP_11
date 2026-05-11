@@ -27,5 +27,4 @@ dist/
 # macOS
 .DS_Store
 
-/results
 Datasets/

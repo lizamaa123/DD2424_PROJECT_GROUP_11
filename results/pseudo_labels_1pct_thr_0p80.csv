@@ -1,0 +1,8 @@
+image_path,pseudo_label,confidence
+C:\Users\Kalle\Documents\Datasets\oxford-iiit-pet\images\basset_hound_118.jpg,3,0.8529830574989319
+C:\Users\Kalle\Documents\Datasets\oxford-iiit-pet\images\basset_hound_121.jpg,3,0.8316791653633118
+C:\Users\Kalle\Documents\Datasets\oxford-iiit-pet\images\basset_hound_129.jpg,3,0.8360446691513062
+C:\Users\Kalle\Documents\Datasets\oxford-iiit-pet\images\japanese_chin_121.jpg,17,0.8798426389694214
+C:\Users\Kalle\Documents\Datasets\oxford-iiit-pet\images\basset_hound_190.jpg,3,0.8463056087493896
+C:\Users\Kalle\Documents\Datasets\oxford-iiit-pet\images\japanese_chin_148.jpg,17,0.9635356664657593
+C:\Users\Kalle\Documents\Datasets\oxford-iiit-pet\images\japanese_chin_189.jpg,17,0.8157877326011658
