@@ -1,2 +1,4 @@
-10pct: best threshold 0.80 improved macro-F1 by 0.0076 and accuracy by 0.0079.
-1pct: best threshold 0.80 did not improve macro-F1 (delta -0.0832).
+20pct: best threshold 0.60 improved macro-F1 by 0.0194 and accuracy by 0.0199.
+10pct: best threshold 0.60 improved macro-F1 by 0.0105 and accuracy by 0.0142.
+5pct: best threshold 0.60 improved macro-F1 by 0.0087 and accuracy by 0.0144.
+1pct: best threshold 0.80 did not improve macro-F1 (delta -0.0547).
