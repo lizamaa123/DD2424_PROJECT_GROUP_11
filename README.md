@@ -26,6 +26,7 @@ TRAINING MODES:
      - `BASELINE_LR=2e-3`
      - `PSEUDO_LR=1e-3`
      - `WEIGHT_DECAY=1e-3`
+     - `PSEUDO_MODEL_MODE=linear_probe` (or `finetune_layer4`)
    - Run `python src/main.py`
 
 ARTIFACTS WRITTEN TO `results/`:

@@ -138,7 +138,16 @@ def train_model(
     weight_decay: float = 1e-4,
 ):
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.fc.parameters(), lr=lr, weight_decay=weight_decay)
+    trainable_parameters = [p for p in model.parameters() if p.requires_grad]
+
+    if len(trainable_parameters) == 0:
+        raise ValueError("No trainable parameters found. Check requires_grad settings.")
+
+    optimizer = torch.optim.Adam(
+        trainable_parameters,
+        lr=lr,
+        weight_decay=weight_decay,
+    )
 
     # track metrics and best model state
     history = {

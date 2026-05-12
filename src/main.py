@@ -87,12 +87,29 @@ def make_loader(dataset, batch_size, num_workers, pin_memory, shuffle, seed: int
     return DataLoader(**kwargs)
 
 
-def create_linear_probe_model(device, num_classes: int = 37):
+def create_transfer_model(device, num_classes: int = 37, mode: str = "linear_probe"):
     model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+
     for param in model.parameters():
         param.requires_grad = False
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
+
+    if mode == "linear_probe":
+        for param in model.fc.parameters():
+            param.requires_grad = True
+    elif mode == "finetune_layer4":
+        for param in model.layer4.parameters():
+            param.requires_grad = True
+        for param in model.fc.parameters():
+            param.requires_grad = True
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
     return model.to(device)
+
+
+def count_trainable_parameters(model) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def save_pseudo_labels_csv(pseudo_samples, save_path: Path) -> None:
@@ -180,7 +197,11 @@ def run_full_supervised_training(
         return_datasets=True,
     )
 
-    model = create_linear_probe_model(device=device, num_classes=37)
+    model = create_transfer_model(device=device, num_classes=37, mode="linear_probe")
+    print(
+        "Full supervised mode=linear_probe | "
+        f"trainable_params={count_trainable_parameters(model):,}"
+    )
     model, history = train_model(
         model=model,
         train_loader=train_loader,
@@ -230,6 +251,8 @@ def run_limited_label_experiments(
     baseline_lr = float(os.getenv("BASELINE_LR", "2e-3"))
     pseudo_lr = float(os.getenv("PSEUDO_LR", "1e-3"))
     weight_decay = float(os.getenv("WEIGHT_DECAY", "1e-3"))
+    model_mode = os.getenv("PSEUDO_MODEL_MODE", "linear_probe")
+    print(f"Pseudo-label experiment model mode: {model_mode}")
 
     _train_loader, test_loader, train_dataset, _test_dataset = get_data_loaders(
         dataset_dir=dataset_dir,
@@ -272,7 +295,15 @@ def run_limited_label_experiments(
             shuffle=False,
         )
 
-        baseline_model = create_linear_probe_model(device=device, num_classes=37)
+        baseline_model = create_transfer_model(
+            device=device,
+            num_classes=37,
+            mode=model_mode,
+        )
+        print(
+            f"[{fraction_tag}] Baseline mode={model_mode} | "
+            f"trainable_params={count_trainable_parameters(baseline_model):,}"
+        )
         baseline_model, baseline_history = train_model(
             model=baseline_model,
             train_loader=labeled_loader,
@@ -297,6 +328,11 @@ def run_limited_label_experiments(
         save_training_curves(baseline_history, baseline_curves_path)
         baseline_per_class_path = results_dir / f"per_class_metrics_baseline_{fraction_tag}.csv"
         save_per_class_metrics_csv(baseline_metrics, baseline_per_class_path)
+        print(
+            f"[{fraction_tag}] Baseline metrics | "
+            f"acc={baseline_metrics['accuracy']:.4%}, "
+            f"macro_f1={baseline_metrics['macro_f1']:.4f}"
+        )
 
         baseline_by_fraction[labeled_fraction] = baseline_metrics
         comparison_rows.append(
@@ -335,6 +371,11 @@ def run_limited_label_experiments(
             for threshold in pseudo_thresholds:
                 stats = threshold_stats[float(threshold)]
                 writer.writerow([threshold, stats["total"], stats["kept"], stats["keep_ratio"]])
+                print(
+                    f"[{fraction_tag}] Threshold {threshold:.2f} | "
+                    f"kept={stats['kept']}/{stats['total']} "
+                    f"({stats['keep_ratio']:.2%})"
+                )
 
         for threshold in pseudo_thresholds:
             threshold_tag = threshold_to_tag(threshold)
@@ -388,7 +429,15 @@ def run_limited_label_experiments(
                 seed=42,
             )
 
-            pseudo_model = create_linear_probe_model(device=device, num_classes=37)
+            pseudo_model = create_transfer_model(
+                device=device,
+                num_classes=37,
+                mode=model_mode,
+            )
+            print(
+                f"[{fraction_tag}] Student mode={model_mode}, threshold={threshold:.2f} | "
+                f"trainable_params={count_trainable_parameters(pseudo_model):,}"
+            )
             pseudo_model, pseudo_history = train_model(
                 model=pseudo_model,
                 train_loader=combined_train_loader,
@@ -419,6 +468,13 @@ def run_limited_label_experiments(
             save_per_class_metrics_csv(pseudo_metrics, pseudo_per_class_path)
 
             baseline_metrics_ref = baseline_by_fraction[labeled_fraction]
+            print(
+                f"[{fraction_tag}] Threshold {threshold:.2f} metrics | "
+                f"baseline_acc={baseline_metrics_ref['accuracy']:.4%}, "
+                f"baseline_macro_f1={baseline_metrics_ref['macro_f1']:.4f}, "
+                f"pseudo_acc={pseudo_metrics['accuracy']:.4%}, "
+                f"pseudo_macro_f1={pseudo_metrics['macro_f1']:.4f}"
+            )
             comparison_rows.append(
                 {
                     "scenario": "pseudo_label_training",
