@@ -14,7 +14,9 @@ from torchvision.models import ResNet18_Weights
 
 from data.pet_dataset import (
     OxfordPetPseudoLabelDataset,
+    OxfordPetUnlabeledConsistencyDataset,
     OxfordPetUnlabeledSubsetDataset,
+    get_consistency_transforms,
     get_data_loaders,
     stratified_labeled_unlabeled_indices,
 )
@@ -22,6 +24,7 @@ from training.engine import (
     evaluate_detailed,
     generate_pseudo_labels,
     save_training_curves,
+    train_consistency_regularized_model,
     train_model,
 )
 
@@ -173,12 +176,38 @@ def save_comparison_csv(rows, save_path: Path):
         writer.writerows(rows)
 
 
+def save_consistency_history_csv(history, save_path: Path) -> None:
+    keys = [
+        "train_loss",
+        "train_supervised_loss",
+        "train_unsupervised_loss",
+        "pseudo_keep_ratio",
+        "test_loss",
+        "test_acc",
+        "test_macro_f1",
+    ]
+    epochs = len(history["train_loss"])
+
+    with open(save_path, "w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["epoch", *keys])
+        for epoch_idx in range(epochs):
+            row = [epoch_idx + 1]
+            for key in keys:
+                row.append(history[key][epoch_idx])
+            writer.writerow(row)
+
+
 def fraction_to_tag(fraction: float) -> str:
     return f"{int(round(fraction * 100))}pct"
 
 
 def threshold_to_tag(threshold: float) -> str:
     return f"{threshold:.2f}".replace(".", "p")
+
+
+def lambda_to_tag(lambda_u: float) -> str:
+    return f"{lambda_u:.2f}".replace(".", "p")
 
 
 def run_full_supervised_training(
@@ -240,8 +269,10 @@ def run_limited_label_experiments(
     results_dir,
 ):
     figures_dir = results_dir / "figures"
+    histories_dir = results_dir / "histories"
     models_dir = results_dir / "models"
     figures_dir.mkdir(parents=True, exist_ok=True)
+    histories_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
 
     labeled_fractions = parse_float_list_env("LABELED_FRACTIONS", "0.1,0.01")
@@ -252,7 +283,41 @@ def run_limited_label_experiments(
     pseudo_lr = float(os.getenv("PSEUDO_LR", "1e-3"))
     weight_decay = float(os.getenv("WEIGHT_DECAY", "1e-3"))
     model_mode = os.getenv("PSEUDO_MODEL_MODE", "linear_probe")
-    print(f"Pseudo-label experiment model mode: {model_mode}")
+    enable_offline_pseudo_labeling = get_env_flag("ENABLE_OFFLINE_PSEUDO_LABELING", default=True)
+    enable_consistency_regularization = get_env_flag(
+        "ENABLE_CONSISTENCY_REGULARIZATION",
+        default=False,
+    )
+    consistency_thresholds_env = os.getenv("CONSISTENCY_THRESHOLDS")
+    if consistency_thresholds_env is None:
+        consistency_thresholds = list(pseudo_thresholds)
+    else:
+        consistency_thresholds = parse_float_list_env(
+            "CONSISTENCY_THRESHOLDS",
+            consistency_thresholds_env,
+        )
+    consistency_lambdas = parse_float_list_env(
+        "CONSISTENCY_LAMBDAS",
+        os.getenv("CONSISTENCY_LAMBDA_U", "1.0"),
+    )
+    consistency_epochs = int(os.getenv("CONSISTENCY_EPOCHS", str(pseudo_epochs)))
+    consistency_lr = float(os.getenv("CONSISTENCY_LR", str(pseudo_lr)))
+    run_tag = os.getenv("RUN_TAG", time.strftime("%Y%m%d_%H%M%S"))
+
+    print(
+        "Limited-label settings | "
+        f"model_mode={model_mode}, "
+        f"offline_pseudo={enable_offline_pseudo_labeling}, "
+        f"consistency_regularization={enable_consistency_regularization}"
+    )
+    if enable_consistency_regularization:
+        print(
+            "Consistency settings | "
+            f"thresholds={consistency_thresholds}, "
+            f"lambdas={consistency_lambdas}, "
+            f"epochs={consistency_epochs}, lr={consistency_lr}"
+        )
+    print(f"Run tag: {run_tag}")
 
     _train_loader, test_loader, train_dataset, _test_dataset = get_data_loaders(
         dataset_dir=dataset_dir,
@@ -268,16 +333,23 @@ def run_limited_label_experiments(
 
     for labeled_fraction in labeled_fractions:
         fraction_tag = fraction_to_tag(labeled_fraction)
-        print(f"\n--- Running limited-label setup: {fraction_tag} ---")
+        print(f"\n--- Running limited-label setup: {fraction_tag} | model_mode={model_mode} ---")
 
         labeled_indices, unlabeled_indices = stratified_labeled_unlabeled_indices(
             train_dataset,
             labeled_fraction=labeled_fraction,
             seed=42,
         )
+        print(
+            f"[{fraction_tag}] Samples | "
+            f"labeled={len(labeled_indices)}, unlabeled={len(unlabeled_indices)}"
+        )
 
         labeled_dataset = Subset(train_dataset, labeled_indices)
-        unlabeled_subset_dataset = OxfordPetUnlabeledSubsetDataset(train_dataset, unlabeled_indices)
+        unlabeled_subset_dataset = OxfordPetUnlabeledSubsetDataset(
+            train_dataset,
+            unlabeled_indices,
+        )
 
         labeled_loader = make_loader(
             labeled_dataset,
@@ -340,8 +412,10 @@ def run_limited_label_experiments(
                 "scenario": "supervised_baseline",
                 "labeled_fraction": labeled_fraction,
                 "threshold": "",
+                "lambda_u": "",
                 "labeled_samples": len(labeled_indices),
                 "pseudo_samples": 0,
+                "confident_unlabeled_samples": 0,
                 "total_train_samples": len(labeled_indices),
                 "test_accuracy": baseline_metrics["accuracy"],
                 "test_macro_f1": baseline_metrics["macro_f1"],
@@ -349,156 +423,297 @@ def run_limited_label_experiments(
                 "delta_macro_f1_vs_baseline": 0.0,
                 "model_path": str(baseline_model_path),
                 "curves_path": str(baseline_curves_path),
+                "history_path": "",
                 "pseudo_labels_path": "",
             }
         )
 
-        pseudo_samples_all, threshold_stats = generate_pseudo_labels(
-            model=baseline_model,
-            unlabeled_loader=unlabeled_loader,
-            device=device,
-            thresholds=pseudo_thresholds,
-        )
+        if enable_offline_pseudo_labeling:
+            pseudo_samples_all, threshold_stats = generate_pseudo_labels(
+                model=baseline_model,
+                unlabeled_loader=unlabeled_loader,
+                device=device,
+                thresholds=pseudo_thresholds,
+            )
 
-        pseudo_all_path = results_dir / f"pseudo_labels_{fraction_tag}_all.csv"
-        save_pseudo_labels_csv(pseudo_samples_all, pseudo_all_path)
-        pseudo_samples_all = load_pseudo_labels_csv(pseudo_all_path)
+            pseudo_all_path = results_dir / f"pseudo_labels_{fraction_tag}_all.csv"
+            save_pseudo_labels_csv(pseudo_samples_all, pseudo_all_path)
+            pseudo_samples_all = load_pseudo_labels_csv(pseudo_all_path)
 
-        threshold_stats_path = results_dir / f"pseudo_label_threshold_stats_{fraction_tag}.csv"
-        with open(threshold_stats_path, "w", newline="") as csv_file:
-            writer = csv.writer(csv_file)
-            writer.writerow(["threshold", "total", "kept", "keep_ratio"])
+            threshold_stats_path = results_dir / f"pseudo_label_threshold_stats_{fraction_tag}.csv"
+            with open(threshold_stats_path, "w", newline="") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(["threshold", "total", "kept", "keep_ratio"])
+                for threshold in pseudo_thresholds:
+                    stats = threshold_stats[float(threshold)]
+                    writer.writerow([threshold, stats["total"], stats["kept"], stats["keep_ratio"]])
+                    print(
+                        f"[{fraction_tag}] Pseudo threshold {threshold:.2f} | "
+                        f"kept={stats['kept']}/{stats['total']} "
+                        f"({stats['keep_ratio']:.2%})"
+                    )
+
             for threshold in pseudo_thresholds:
-                stats = threshold_stats[float(threshold)]
-                writer.writerow([threshold, stats["total"], stats["kept"], stats["keep_ratio"]])
-                print(
-                    f"[{fraction_tag}] Threshold {threshold:.2f} | "
-                    f"kept={stats['kept']}/{stats['total']} "
-                    f"({stats['keep_ratio']:.2%})"
+                threshold_tag = threshold_to_tag(threshold)
+                filtered_samples = filter_pseudo_samples_by_threshold(
+                    pseudo_samples_all,
+                    threshold,
                 )
 
-        for threshold in pseudo_thresholds:
-            threshold_tag = threshold_to_tag(threshold)
-            filtered_samples = filter_pseudo_samples_by_threshold(pseudo_samples_all, threshold)
+                filtered_pseudo_path = (
+                    results_dir / f"pseudo_labels_{fraction_tag}_thr_{threshold_tag}.csv"
+                )
+                save_pseudo_labels_csv(filtered_samples, filtered_pseudo_path)
 
-            filtered_pseudo_path = (
-                results_dir / f"pseudo_labels_{fraction_tag}_thr_{threshold_tag}.csv"
-            )
-            save_pseudo_labels_csv(filtered_samples, filtered_pseudo_path)
+                class_dist = get_pseudo_label_class_distribution(filtered_samples, num_classes=37)
+                class_dist_path = (
+                    results_dir
+                    / f"pseudo_label_class_distribution_{fraction_tag}_thr_{threshold_tag}.csv"
+                )
+                save_class_distribution_csv(class_dist, class_dist_path)
 
-            class_dist = get_pseudo_label_class_distribution(filtered_samples, num_classes=37)
-            class_dist_path = (
-                results_dir / f"pseudo_label_class_distribution_{fraction_tag}_thr_{threshold_tag}.csv"
-            )
-            save_class_distribution_csv(class_dist, class_dist_path)
+                if len(filtered_samples) == 0:
+                    comparison_rows.append(
+                        {
+                            "scenario": "pseudo_label_training",
+                            "labeled_fraction": labeled_fraction,
+                            "threshold": threshold,
+                            "lambda_u": "",
+                            "labeled_samples": len(labeled_indices),
+                            "pseudo_samples": 0,
+                            "confident_unlabeled_samples": 0,
+                            "total_train_samples": len(labeled_indices),
+                            "test_accuracy": "",
+                            "test_macro_f1": "",
+                            "delta_acc_vs_baseline": "",
+                            "delta_macro_f1_vs_baseline": "",
+                            "model_path": "",
+                            "curves_path": "",
+                            "history_path": "",
+                            "pseudo_labels_path": str(filtered_pseudo_path),
+                        }
+                    )
+                    print(
+                        f"Skipping pseudo threshold {threshold:.2f} for {fraction_tag}: "
+                        "no pseudo labels kept."
+                    )
+                    continue
 
-            if len(filtered_samples) == 0:
+                pseudo_dataset = OxfordPetPseudoLabelDataset(
+                    pseudo_samples=filtered_samples,
+                    transform=train_dataset.transform,
+                )
+                combined_train_dataset = ConcatDataset([labeled_dataset, pseudo_dataset])
+                combined_train_loader = make_loader(
+                    combined_train_dataset,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    shuffle=True,
+                    seed=42,
+                )
+
+                pseudo_model = create_transfer_model(
+                    device=device,
+                    num_classes=37,
+                    mode=model_mode,
+                )
+                print(
+                    f"[{fraction_tag}] Pseudo student | mode={model_mode}, "
+                    f"threshold={threshold:.2f}, trainable_params={count_trainable_parameters(pseudo_model):,}"
+                )
+                pseudo_model, pseudo_history = train_model(
+                    model=pseudo_model,
+                    train_loader=combined_train_loader,
+                    test_loader=test_loader,
+                    device=device,
+                    epochs=pseudo_epochs,
+                    lr=pseudo_lr,
+                    weight_decay=weight_decay,
+                )
+
+                pseudo_metrics = evaluate_detailed(
+                    model=pseudo_model,
+                    loader=test_loader,
+                    criterion=criterion,
+                    device=device,
+                    num_classes=37,
+                )
+
+                pseudo_model_path = models_dir / f"pseudo_{fraction_tag}_thr_{threshold_tag}.pth"
+                torch.save(pseudo_model.state_dict(), pseudo_model_path)
+                pseudo_curves_path = (
+                    figures_dir / f"training_curves_pseudo_{fraction_tag}_thr_{threshold_tag}.png"
+                )
+                save_training_curves(pseudo_history, pseudo_curves_path)
+                pseudo_per_class_path = (
+                    results_dir / f"per_class_metrics_pseudo_{fraction_tag}_thr_{threshold_tag}.csv"
+                )
+                save_per_class_metrics_csv(pseudo_metrics, pseudo_per_class_path)
+
+                baseline_metrics_ref = baseline_by_fraction[labeled_fraction]
+                print(
+                    f"[{fraction_tag}] Pseudo threshold {threshold:.2f} metrics | "
+                    f"baseline_acc={baseline_metrics_ref['accuracy']:.4%}, "
+                    f"baseline_macro_f1={baseline_metrics_ref['macro_f1']:.4f}, "
+                    f"pseudo_acc={pseudo_metrics['accuracy']:.4%}, "
+                    f"pseudo_macro_f1={pseudo_metrics['macro_f1']:.4f}"
+                )
                 comparison_rows.append(
                     {
                         "scenario": "pseudo_label_training",
                         "labeled_fraction": labeled_fraction,
                         "threshold": threshold,
+                        "lambda_u": "",
                         "labeled_samples": len(labeled_indices),
-                        "pseudo_samples": 0,
-                        "total_train_samples": len(labeled_indices),
-                        "test_accuracy": "",
-                        "test_macro_f1": "",
-                        "delta_acc_vs_baseline": "",
-                        "delta_macro_f1_vs_baseline": "",
-                        "model_path": "",
-                        "curves_path": "",
+                        "pseudo_samples": len(filtered_samples),
+                        "confident_unlabeled_samples": len(filtered_samples),
+                        "total_train_samples": len(combined_train_dataset),
+                        "test_accuracy": pseudo_metrics["accuracy"],
+                        "test_macro_f1": pseudo_metrics["macro_f1"],
+                        "delta_acc_vs_baseline": (
+                            pseudo_metrics["accuracy"] - baseline_metrics_ref["accuracy"]
+                        ),
+                        "delta_macro_f1_vs_baseline": (
+                            pseudo_metrics["macro_f1"] - baseline_metrics_ref["macro_f1"]
+                        ),
+                        "model_path": str(pseudo_model_path),
+                        "curves_path": str(pseudo_curves_path),
+                        "history_path": "",
                         "pseudo_labels_path": str(filtered_pseudo_path),
                     }
                 )
+        else:
+            print(f"[{fraction_tag}] Skipping offline pseudo-label training (disabled).")
+
+        if enable_consistency_regularization:
+            if len(unlabeled_indices) == 0:
                 print(
-                    f"Skipping threshold {threshold:.2f} for {fraction_tag}: no pseudo labels kept."
+                    f"[{fraction_tag}] Skipping consistency regularization: "
+                    "no unlabeled samples available."
                 )
-                continue
+            else:
+                weak_transform, strong_transform = get_consistency_transforms(image_size=224)
+                consistency_unlabeled_dataset = OxfordPetUnlabeledConsistencyDataset(
+                    base_dataset=train_dataset,
+                    indices=unlabeled_indices,
+                    weak_transform=weak_transform,
+                    strong_transform=strong_transform,
+                )
+                consistency_unlabeled_loader = make_loader(
+                    consistency_unlabeled_dataset,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    shuffle=True,
+                    seed=42,
+                )
 
-            pseudo_dataset = OxfordPetPseudoLabelDataset(
-                pseudo_samples=filtered_samples,
-                transform=train_dataset.transform,
-            )
-            combined_train_dataset = ConcatDataset([labeled_dataset, pseudo_dataset])
-            combined_train_loader = make_loader(
-                combined_train_dataset,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                shuffle=True,
-                seed=42,
-            )
+                for threshold in consistency_thresholds:
+                    threshold_tag = threshold_to_tag(threshold)
+                    for lambda_u in consistency_lambdas:
+                        lambda_tag = lambda_to_tag(lambda_u)
+                        consistency_model = create_transfer_model(
+                            device=device,
+                            num_classes=37,
+                            mode=model_mode,
+                        )
+                        print(
+                            f"[{fraction_tag}] Consistency run | "
+                            f"mode={model_mode}, threshold={threshold:.2f}, lambda_u={lambda_u:.2f}, "
+                            f"labeled={len(labeled_indices)}, unlabeled={len(unlabeled_indices)}, "
+                            f"trainable_params={count_trainable_parameters(consistency_model):,}"
+                        )
+                        consistency_model, consistency_history = train_consistency_regularized_model(
+                            model=consistency_model,
+                            labeled_loader=labeled_loader,
+                            unlabeled_loader=consistency_unlabeled_loader,
+                            test_loader=test_loader,
+                            device=device,
+                            epochs=consistency_epochs,
+                            lr=consistency_lr,
+                            weight_decay=weight_decay,
+                            confidence_threshold=threshold,
+                            lambda_u=lambda_u,
+                            freeze_batchnorm=True,
+                        )
 
-            pseudo_model = create_transfer_model(
-                device=device,
-                num_classes=37,
-                mode=model_mode,
-            )
-            print(
-                f"[{fraction_tag}] Student mode={model_mode}, threshold={threshold:.2f} | "
-                f"trainable_params={count_trainable_parameters(pseudo_model):,}"
-            )
-            pseudo_model, pseudo_history = train_model(
-                model=pseudo_model,
-                train_loader=combined_train_loader,
-                test_loader=test_loader,
-                device=device,
-                epochs=pseudo_epochs,
-                lr=pseudo_lr,
-                weight_decay=weight_decay,
-            )
+                        consistency_metrics = evaluate_detailed(
+                            model=consistency_model,
+                            loader=test_loader,
+                            criterion=criterion,
+                            device=device,
+                            num_classes=37,
+                        )
 
-            pseudo_metrics = evaluate_detailed(
-                model=pseudo_model,
-                loader=test_loader,
-                criterion=criterion,
-                device=device,
-                num_classes=37,
-            )
+                        consistency_model_path = (
+                            models_dir
+                            / f"consistency_{fraction_tag}_thr_{threshold_tag}_lambda_{lambda_tag}.pth"
+                        )
+                        torch.save(consistency_model.state_dict(), consistency_model_path)
+                        consistency_history_path = (
+                            histories_dir
+                            / f"consistency_history_{fraction_tag}_thr_{threshold_tag}_lambda_{lambda_tag}.csv"
+                        )
+                        save_consistency_history_csv(consistency_history, consistency_history_path)
+                        consistency_per_class_path = (
+                            results_dir
+                            / f"per_class_metrics_consistency_{fraction_tag}_thr_{threshold_tag}_lambda_{lambda_tag}.csv"
+                        )
+                        save_per_class_metrics_csv(
+                            consistency_metrics,
+                            consistency_per_class_path,
+                        )
 
-            pseudo_model_path = models_dir / f"pseudo_{fraction_tag}_thr_{threshold_tag}.pth"
-            torch.save(pseudo_model.state_dict(), pseudo_model_path)
-            pseudo_curves_path = (
-                figures_dir / f"training_curves_pseudo_{fraction_tag}_thr_{threshold_tag}.png"
-            )
-            save_training_curves(pseudo_history, pseudo_curves_path)
-            pseudo_per_class_path = (
-                results_dir / f"per_class_metrics_pseudo_{fraction_tag}_thr_{threshold_tag}.csv"
-            )
-            save_per_class_metrics_csv(pseudo_metrics, pseudo_per_class_path)
+                        keep_ratio = (
+                            consistency_history["pseudo_keep_ratio"][-1]
+                            if consistency_history["pseudo_keep_ratio"]
+                            else 0.0
+                        )
+                        estimated_confident_samples = int(round(keep_ratio * len(unlabeled_indices)))
+                        baseline_metrics_ref = baseline_by_fraction[labeled_fraction]
+                        delta_acc = consistency_metrics["accuracy"] - baseline_metrics_ref["accuracy"]
+                        delta_macro_f1 = (
+                            consistency_metrics["macro_f1"] - baseline_metrics_ref["macro_f1"]
+                        )
+                        print(
+                            f"[{fraction_tag}] Consistency threshold {threshold:.2f}, lambda_u={lambda_u:.2f} | "
+                            f"epoch_keep_ratio={keep_ratio:.2%}, "
+                            f"baseline_acc={baseline_metrics_ref['accuracy']:.4%}, "
+                            f"baseline_macro_f1={baseline_metrics_ref['macro_f1']:.4f}, "
+                            f"consistency_acc={consistency_metrics['accuracy']:.4%}, "
+                            f"consistency_macro_f1={consistency_metrics['macro_f1']:.4f}, "
+                            f"delta_acc={delta_acc:+.4f}, delta_macro_f1={delta_macro_f1:+.4f}"
+                        )
 
-            baseline_metrics_ref = baseline_by_fraction[labeled_fraction]
-            print(
-                f"[{fraction_tag}] Threshold {threshold:.2f} metrics | "
-                f"baseline_acc={baseline_metrics_ref['accuracy']:.4%}, "
-                f"baseline_macro_f1={baseline_metrics_ref['macro_f1']:.4f}, "
-                f"pseudo_acc={pseudo_metrics['accuracy']:.4%}, "
-                f"pseudo_macro_f1={pseudo_metrics['macro_f1']:.4f}"
-            )
-            comparison_rows.append(
-                {
-                    "scenario": "pseudo_label_training",
-                    "labeled_fraction": labeled_fraction,
-                    "threshold": threshold,
-                    "labeled_samples": len(labeled_indices),
-                    "pseudo_samples": len(filtered_samples),
-                    "total_train_samples": len(combined_train_dataset),
-                    "test_accuracy": pseudo_metrics["accuracy"],
-                    "test_macro_f1": pseudo_metrics["macro_f1"],
-                    "delta_acc_vs_baseline": (
-                        pseudo_metrics["accuracy"] - baseline_metrics_ref["accuracy"]
-                    ),
-                    "delta_macro_f1_vs_baseline": (
-                        pseudo_metrics["macro_f1"] - baseline_metrics_ref["macro_f1"]
-                    ),
-                    "model_path": str(pseudo_model_path),
-                    "curves_path": str(pseudo_curves_path),
-                    "pseudo_labels_path": str(filtered_pseudo_path),
-                }
-            )
+                        comparison_rows.append(
+                            {
+                                "scenario": "consistency_regularization",
+                                "labeled_fraction": labeled_fraction,
+                                "threshold": threshold,
+                                "lambda_u": lambda_u,
+                                "labeled_samples": len(labeled_indices),
+                                "pseudo_samples": estimated_confident_samples,
+                                "confident_unlabeled_samples": estimated_confident_samples,
+                                "total_train_samples": len(labeled_indices)
+                                + estimated_confident_samples,
+                                "test_accuracy": consistency_metrics["accuracy"],
+                                "test_macro_f1": consistency_metrics["macro_f1"],
+                                "delta_acc_vs_baseline": delta_acc,
+                                "delta_macro_f1_vs_baseline": delta_macro_f1,
+                                "model_path": str(consistency_model_path),
+                                "curves_path": "",
+                                "history_path": str(consistency_history_path),
+                                "pseudo_labels_path": "",
+                            }
+                        )
+        else:
+            print(f"[{fraction_tag}] Consistency regularization disabled.")
 
-    comparison_path = results_dir / "semi_supervised_comparison.csv"
+    comparison_path = results_dir / f"semi_supervised_comparison_{run_tag}.csv"
     save_comparison_csv(comparison_rows, comparison_path)
+    latest_comparison_path = results_dir / "semi_supervised_comparison_latest.csv"
+    save_comparison_csv(comparison_rows, latest_comparison_path)
 
     grouped_rows = defaultdict(list)
     for row in comparison_rows:
@@ -506,38 +721,49 @@ def run_limited_label_experiments(
 
     conclusion_lines = []
     for labeled_fraction, rows in grouped_rows.items():
-        pseudo_rows = [
+        semi_supervised_rows = [
             row
             for row in rows
-            if row["scenario"] == "pseudo_label_training" and row["test_macro_f1"] != ""
+            if row["scenario"] in {"pseudo_label_training", "consistency_regularization"}
+            and row["test_macro_f1"] != ""
         ]
-        if not pseudo_rows:
+        if not semi_supervised_rows:
             conclusion_lines.append(
-                f"{fraction_to_tag(labeled_fraction)}: no pseudo-label threshold produced trainable data."
+                f"{fraction_to_tag(labeled_fraction)}: no semi-supervised scenario produced trainable results."
             )
             continue
 
-        best_row = max(pseudo_rows, key=lambda row: float(row["test_macro_f1"]))
+        best_row = max(semi_supervised_rows, key=lambda row: float(row["test_macro_f1"]))
         delta_f1 = float(best_row["delta_macro_f1_vs_baseline"])
         delta_acc = float(best_row["delta_acc_vs_baseline"])
         threshold = float(best_row["threshold"])
+        scenario = str(best_row["scenario"])
+        lambda_u_value = best_row.get("lambda_u", "")
+        lambda_text = ""
+        if scenario == "consistency_regularization" and lambda_u_value != "":
+            lambda_text = f" lambda {float(lambda_u_value):.2f}"
         if delta_f1 > 0:
             conclusion_lines.append(
-                f"{fraction_to_tag(labeled_fraction)}: best threshold {threshold:.2f} "
+                f"{fraction_to_tag(labeled_fraction)}: best {scenario} threshold {threshold:.2f}{lambda_text} "
                 f"improved macro-F1 by {delta_f1:.4f} and accuracy by {delta_acc:.4f}."
             )
         else:
             conclusion_lines.append(
-                f"{fraction_to_tag(labeled_fraction)}: best threshold {threshold:.2f} "
+                f"{fraction_to_tag(labeled_fraction)}: best {scenario} threshold {threshold:.2f}{lambda_text} "
                 f"did not improve macro-F1 (delta {delta_f1:.4f})."
             )
 
-    conclusion_path = results_dir / "semi_supervised_conclusion.txt"
+    conclusion_path = results_dir / f"semi_supervised_conclusion_{run_tag}.txt"
     with open(conclusion_path, "w") as f:
+        f.write("\n".join(conclusion_lines) + "\n")
+    latest_conclusion_path = results_dir / "semi_supervised_conclusion_latest.txt"
+    with open(latest_conclusion_path, "w") as f:
         f.write("\n".join(conclusion_lines) + "\n")
 
     print(f"Saved comparison table to: {comparison_path}")
+    print(f"Updated latest comparison table: {latest_comparison_path}")
     print(f"Saved conclusion to: {conclusion_path}")
+    print(f"Updated latest conclusion: {latest_conclusion_path}")
 
 
 def main():
@@ -556,12 +782,19 @@ def main():
 
     device, batch_size, num_workers, pin_memory = get_device_and_loader_settings()
     enable_pseudo_labeling = get_env_flag("ENABLE_PSEUDO_LABELING", default=False)
+    enable_offline_pseudo_labeling = get_env_flag("ENABLE_OFFLINE_PSEUDO_LABELING", default=True)
+    enable_consistency_regularization = get_env_flag(
+        "ENABLE_CONSISTENCY_REGULARIZATION",
+        default=False,
+    )
 
     print(f"Using device: {device}")
     print(
         f"Settings | batch_size={batch_size}, num_workers={num_workers}, "
         f"pin_memory={pin_memory}, amp=False, random_aug=False, "
-        f"pseudo_labeling={enable_pseudo_labeling}"
+        f"limited_label_experiments={enable_pseudo_labeling}, "
+        f"offline_pseudo={enable_offline_pseudo_labeling}, "
+        f"consistency_regularization={enable_consistency_regularization}"
     )
 
     results_dir = Path("results")

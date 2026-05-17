@@ -27,6 +27,12 @@ TRAINING MODES:
      - `PSEUDO_LR=1e-3`
      - `WEIGHT_DECAY=1e-3`
      - `PSEUDO_MODEL_MODE=linear_probe` (or `finetune_layer4`)
+     - `ENABLE_OFFLINE_PSEUDO_LABELING=true` (set `false` to skip offline pseudo-label training)
+     - `ENABLE_CONSISTENCY_REGULARIZATION=false` (set `true` to run FixMatch-lite consistency runs)
+     - `CONSISTENCY_THRESHOLDS=0.7,0.8,0.9` (defaults to `PSEUDO_LABEL_THRESHOLDS`)
+     - `CONSISTENCY_LAMBDA_U=1.0`
+     - `CONSISTENCY_EPOCHS=10` (defaults to `PSEUDO_EPOCHS`)
+     - `CONSISTENCY_LR=1e-3` (defaults to `PSEUDO_LR`)
    - Run `python src/main.py`
 
 ARTIFACTS WRITTEN TO `results/`:
@@ -35,5 +41,6 @@ ARTIFACTS WRITTEN TO `results/`:
 - Model checkpoints in `results/models/`
 - Training curves in `results/figures/`
 - Per-class metrics CSV files (accuracy + F1)
+- Consistency histories in `results/histories/`
 - `semi_supervised_comparison.csv` (baseline vs pseudo-label comparison table)
 - `semi_supervised_conclusion.txt` (short summary of improvement / no improvement)

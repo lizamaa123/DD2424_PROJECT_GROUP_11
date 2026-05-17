@@ -6,7 +6,11 @@ from PIL import Image
 
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 from torchvision.models import ResNet18_Weights
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 class OxfordPetDataset(Dataset):
     def __init__(self, split_file: Path, images_dir: Path, transform=None):
@@ -114,13 +118,79 @@ class OxfordPetUnlabeledSubsetDataset(Dataset):
         if self.transform is not None:
             image = self.transform(image)
         return image, str(image_path)
-    
+
+
+class OxfordPetUnlabeledConsistencyDataset(Dataset):
+    def __init__(
+        self,
+        base_dataset: OxfordPetDataset,
+        indices,
+        weak_transform=None,
+        strong_transform=None,
+    ):
+        self.base_dataset = base_dataset
+        self.indices = list(indices)
+        self.weak_transform = weak_transform
+        self.strong_transform = strong_transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        base_idx = self.indices[idx]
+        image_path, _label = self.base_dataset.samples[base_idx]
+        image = Image.open(image_path).convert("RGB")
+
+        weak_image = self.weak_transform(image) if self.weak_transform is not None else image
+        strong_image = (
+            self.strong_transform(image) if self.strong_transform is not None else image
+        )
+        return weak_image, strong_image
+
+
 def get_transform():
     weights = ResNet18_Weights.DEFAULT
 
     # Use the official preprocessing tied to the pretrained ResNet-18 weights.
     # No extra random augmentation here, to keep runs easier to compare.
     return weights.transforms()
+
+
+def get_consistency_transforms(image_size: int = 224):
+    weak_transform = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+
+    strong_transform = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.RandomResizedCrop(image_size, scale=(0.6, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(
+                brightness=0.4,
+                contrast=0.4,
+                saturation=0.4,
+                hue=0.1,
+            ),
+            transforms.RandomRotation(15),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            transforms.RandomErasing(
+                p=0.25,
+                scale=(0.02, 0.2),
+                ratio=(0.3, 3.3),
+                value=0.0,
+            ),
+        ]
+    )
+
+    return weak_transform, strong_transform
 
 def get_data_loaders(
     dataset_dir: Path,
