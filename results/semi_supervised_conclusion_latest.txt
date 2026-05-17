@@ -1,0 +1,2 @@
+10pct: best consistency_regularization threshold 0.80 lambda 0.50 did not improve macro-F1 (delta -0.0373).
+1pct: best consistency_regularization threshold 0.80 lambda 2.00 did not improve macro-F1 (delta -0.1151).
